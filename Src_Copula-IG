@@ -1,0 +1,530 @@
+# -*- coding: utf-8 -*-
+"""
+Copula–Information Gain (Copula–IG) pipeline (Gaussian & Clayton Copula)
+
+This script is a cleaned, GitHub-ready version of the pipeline you shared:
+- Computes YEAR-level lag/corr/p (Spearman) between SPEI and each indicator
+- For each drought event, computes event-level lag/corr/p if window is long enough;
+  otherwise falls back to year-level maps
+- For each event and each pixel, computes:
+  thr, auc, mcc, ig, rho, theta, C_gauss, C_clay
+- Writes all outputs as GeoTIFFs
+
+Usage:
+  python src/Copula-IG.py --config config/config.example.yml --mode raw
+  python src/Copula-IG.py --config config/config.example.yml --mode stdz
+
+Notes:
+- Do NOT commit your full-resolution data. Use config/config.local.yml (gitignored).
+- Provide a minimal sample dataset (included under data/sample/) for reproducibility.
+"""
+import os, re, math, warnings, argparse
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import rasterio
+from scipy.stats import spearmanr, kendalltau, norm, zscore
+from scipy.stats import multivariate_normal
+from sklearn.metrics import roc_curve, auc, matthews_corrcoef
+from sklearn.feature_selection import mutual_info_classif
+from tqdm import tqdm
+import yaml
+
+
+# -------------------------- IO helpers --------------------------
+def read_stack_from_folder(folder: str):
+    """Read a folder of monthly single-band GeoTIFFs into a stack (T,H,W) and return (stack, profile, yms)."""
+    files = sorted([os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(".tif")])
+    arrs, yms = [], []
+    prof = None
+
+    for f in files:
+        fname = os.path.basename(f)
+
+        # Parse time key (YYYYMM)
+        upper_folder = os.path.basename(folder).upper()
+        if ("GPP" in upper_folder) or ("GOSIF" in upper_folder) or ("SIF" in upper_folder):
+            m = re.search(r'(\d{4})\.M(\d{2})', fname)
+            if m:
+                ym = f"{m.group(1)}{m.group(2)}"
+            else:
+                digits = "".join([c for c in fname if c.isdigit()])
+                ym = digits[:6] if len(digits) >= 6 else None
+        else:
+            digits = "".join([c for c in fname if c.isdigit()])
+            ym = digits[:6] if len(digits) >= 6 else None
+
+        if not ym:
+            continue
+
+        with rasterio.open(f) as ds:
+            arr = ds.read(1).astype(float)
+            if prof is None:
+                prof = ds.profile
+            # treat very negative as nodata
+            arr[arr < -9000] = np.nan
+            arrs.append(arr)
+            yms.append(ym)
+
+    if not arrs:
+        raise RuntimeError(f"No valid GeoTIFFs found in: {folder}")
+    return np.stack(arrs, axis=0), prof, yms
+
+
+def write_geotiff_single(out_path: str, arr2d: np.ndarray, profile: dict, nodata: float):
+    prof = profile.copy()
+    prof.update(dtype=rasterio.float32, count=1, nodata=nodata)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with rasterio.open(out_path, "w", **prof) as dst:
+        out = np.where(np.isfinite(arr2d), arr2d, nodata).astype(np.float32)
+        dst.write(out, 1)
+
+
+# -------------------------- math helpers --------------------------
+def shift_series_forward(arr1d: np.ndarray, lag: int):
+    """Shift series forward by L: y(t) aligns with x(t-L)."""
+    T = len(arr1d)
+    res = np.full(T, np.nan, dtype=float)
+    if lag <= 0:
+        return arr1d.astype(float).copy()
+    if lag >= T:
+        return res
+    res[: T - lag] = arr1d[lag:]
+    return res
+
+
+def youden_threshold_from_scores(feat: np.ndarray, label: np.ndarray, min_valid: int):
+    if np.all(np.isnan(feat)) or len(np.unique(label)) < 2:
+        return np.nan, np.nan, np.nan
+    mask = np.isfinite(feat)
+    if mask.sum() < min_valid:
+        return np.nan, np.nan, np.nan
+    try:
+        fpr, tpr, thresholds = roc_curve(label[mask], feat[mask])
+        if len(fpr) == 0:
+            return np.nan, np.nan, np.nan
+        j_scores = tpr - fpr
+        best = np.nanargmax(j_scores)
+        thr = thresholds[best]
+        auc_v = auc(fpr, tpr)
+        mcc_v = matthews_corrcoef(label[mask], (feat[mask] > thr).astype(int))
+        return thr, auc_v, mcc_v
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+
+def information_gain_univar(feat: np.ndarray, label: np.ndarray, min_valid: int):
+    try:
+        mask = np.isfinite(feat)
+        if mask.sum() < min_valid or len(np.unique(label[mask])) < 2:
+            return np.nan
+        x = feat[mask].reshape(-1, 1)
+        y = label[mask].astype(int)
+        mi = mutual_info_classif(x, y, discrete_features=False, random_state=0)
+        return float(mi[0])
+    except Exception:
+        return np.nan
+
+
+def mi_binary(a, b):
+    """Mutual information for binary arrays a,b (int 0/1)."""
+    a = np.asarray(a).astype(int)
+    b = np.asarray(b).astype(int)
+    mask = np.isfinite(a) & np.isfinite(b)
+    if mask.sum() == 0:
+        return 0.0
+    a = a[mask]
+    b = b[mask]
+    n = len(a)
+    joint = {}
+    for ai, bi in zip(a, b):
+        joint[(ai, bi)] = joint.get((ai, bi), 0) + 1
+    pxy = {k: v / n for k, v in joint.items()}
+    pa = {}
+    pb = {}
+    for (ai, bi), v in joint.items():
+        pa[ai] = pa.get(ai, 0) + v
+        pb[bi] = pb.get(bi, 0) + v
+    pa = {k: v / n for k, v in pa.items()}
+    pb = {k: v / n for k, v in pb.items()}
+    mi = 0.0
+    for (ai, bi), pab in pxy.items():
+        mi += pab * math.log(pab / (pa[ai] * pb[bi]) + 1e-12)
+    return mi
+
+
+# -------------------------- copula helpers --------------------------
+def empirical_u(x: np.ndarray):
+    x = np.asarray(x, dtype=float)
+    u = np.full_like(x, np.nan, dtype=float)
+    mask = np.isfinite(x)
+    if mask.sum() == 0:
+        return u
+    ranks = np.argsort(np.argsort(x[mask])) + 1
+    u[mask] = ranks / (mask.sum() + 1.0)
+    return u
+
+
+def fit_gaussian_copula_u(u, v):
+    mask = np.isfinite(u) & np.isfinite(v)
+    if mask.sum() < 5:
+        return np.nan
+    try:
+        xu = norm.ppf(np.clip(u[mask], 1e-6, 1 - 1e-6))
+        xv = norm.ppf(np.clip(v[mask], 1e-6, 1 - 1e-6))
+        rho = np.corrcoef(xu, xv)[0, 1]
+        return float(rho)
+    except Exception:
+        return np.nan
+
+
+def gaussian_copula_cdf(u, v, rho):
+    if not np.isfinite(rho):
+        return np.nan
+    try:
+        xu = norm.ppf(np.clip(u, 1e-8, 1 - 1e-8))
+        xv = norm.ppf(np.clip(v, 1e-8, 1 - 1e-8))
+        mean = [0, 0]
+        cov = [[1.0, rho], [rho, 1.0]]
+        return float(multivariate_normal.cdf([xu, xv], mean=mean, cov=cov))
+    except Exception:
+        return np.nan
+
+
+def fit_clayton_theta_from_kendall(u, v):
+    mask = np.isfinite(u) & np.isfinite(v)
+    if mask.sum() < 5:
+        return np.nan
+    try:
+        tau, _ = kendalltau(u[mask], v[mask])
+        if (not np.isfinite(tau)) or (tau <= 0):
+            return np.nan
+        theta = 2.0 * tau / (1.0 - tau)
+        return float(theta)
+    except Exception:
+        return np.nan
+
+
+def clayton_copula_cdf(u, v, theta):
+    if (not np.isfinite(theta)) or theta <= 0:
+        return np.nan
+    try:
+        up = np.clip(u, 1e-12, 1.0)
+        vp = np.clip(v, 1e-12, 1.0)
+        val = (up ** (-theta) + vp ** (-theta) - 1.0)
+        if val <= 0:
+            return 0.0
+        return float(val ** (-1.0 / theta))
+    except Exception:
+        return np.nan
+
+
+# -------------------------- lag maps --------------------------
+def compute_best_lag_maps_for_indices(spei_stack, feat_stack, idxs, max_lag, min_valid):
+    """
+    spei_stack, feat_stack: (T,H,W)
+    idxs: subset indices used for computation
+    Returns (best_lag, best_corr, best_p) each (H,W).
+    """
+    _, H, W = spei_stack.shape
+    best_lag = np.full((H, W), -1, dtype=np.int16)
+    best_corr = np.full((H, W), np.nan, dtype=float)
+    best_p = np.full((H, W), np.nan, dtype=float)
+    if len(idxs) == 0:
+        return best_lag, best_corr, best_p
+
+    spei_sub = spei_stack[idxs, :, :]
+    feat_sub = feat_stack[idxs, :, :]
+    t_sub = spei_sub.shape[0]
+
+    for i in range(H):
+        for j in range(W):
+            x0 = spei_sub[:, i, j]
+            y0 = feat_sub[:, i, j]
+            if np.all(np.isnan(x0)) or np.all(np.isnan(y0)):
+                continue
+            best_abs = -1.0
+            best_r = np.nan
+            best_pr = np.nan
+            best_L = -1
+            for L in range(0, min(max_lag, t_sub - 1) + 1):
+                x = x0[: t_sub - L]
+                y = y0[L:t_sub]
+                mask = np.isfinite(x) & np.isfinite(y)
+                if mask.sum() < min_valid:
+                    continue
+                r, p = spearmanr(x[mask], y[mask])
+                if not np.isfinite(r):
+                    continue
+                if abs(r) > best_abs:
+                    best_abs = abs(r)
+                    best_r = r
+                    best_pr = p
+                    best_L = L
+            if best_L >= 0:
+                best_lag[i, j] = int(best_L)
+                best_corr[i, j] = float(best_r)
+                best_p[i, j] = float(best_pr)
+
+    return best_lag, best_corr, best_p
+
+
+# -------------------------- pipeline --------------------------
+def load_config(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    # minimal validation
+    for k in ["data_dirs", "events_xlsx", "out_base", "nodata_value", "year_range"]:
+        if k not in cfg:
+            raise ValueError(f"Missing config key: {k}")
+    return cfg
+
+
+def run_pipeline(cfg: dict, out_dir: str, use_standardized: bool):
+    os.makedirs(out_dir, exist_ok=True)
+    nodata = float(cfg.get("nodata_value", -9999.0))
+    min_valid_corr = int(cfg.get("min_valid_for_corr", 12))
+    min_valid_thr = int(cfg.get("min_valid_for_threshold", 10))
+    max_lag = int(cfg.get("max_lag", 12))
+    grid_n = int(cfg.get("grid_n", 20))
+    spei_thr = float(cfg.get("spei_drought_threshold", -1.0))
+
+    # 1) events
+    df_events = pd.read_excel(cfg["events_xlsx"])
+
+    if "year" not in df_events.columns:
+        if "start" in df_events.columns:
+            try:
+                df_events["year"] = pd.to_datetime(df_events["start"]).dt.year
+            except Exception:
+                df_events["year"] = df_events["start"].astype(str).str[:4].astype(int)
+        elif "start_ym" in df_events.columns:
+            df_events["year"] = df_events["start_ym"].astype(str).str[:4].astype(int)
+        else:
+            raise RuntimeError("Events table must contain year or start/start_ym to infer year.")
+
+    min_y, max_y = cfg["year_range"]
+    df_events = df_events[(df_events["year"] >= min_y) & (df_events["year"] <= max_y)].copy()
+    print(f"Loaded {len(df_events)} events between {min_y}-{max_y}")
+
+    # 2) stacks
+    stacks = {}
+    profiles = {}
+    yms_ref = None
+    for var, folder in cfg["data_dirs"].items():
+        st, prof, yms = read_stack_from_folder(folder)
+        if use_standardized:
+            st = np.apply_along_axis(lambda x: zscore(x, nan_policy="omit"), 0, st)
+        stacks[var] = st
+        profiles[var] = prof
+        if yms_ref is None:
+            yms_ref = yms
+
+        print(f"{var}: shape={st.shape}, standardized={use_standardized}")
+
+    if yms_ref is None:
+        raise RuntimeError("No time indices could be parsed from filenames.")
+
+    prof_out = profiles["SPEI"]
+    T, H, W = stacks["SPEI"].shape
+    ym_to_idx = {ym: i for i, ym in enumerate(yms_ref)}
+
+    # 3) year-level lag maps (fallback)
+    year_level_maps = {}
+    years_needed = sorted(df_events["year"].unique())
+    for year in years_needed:
+        idxs = sorted([idx for ym, idx in ym_to_idx.items() if ym.startswith(str(year))])
+        if len(idxs) == 0:
+            print(f"Year {year}: no slices found, skipping.")
+            continue
+        year_level_maps[year] = {}
+        for ind in ["NDVI", "LAI", "GPP", "SIF"]:
+            print(f"Computing YEAR-level lag for {ind} in {year} (n={len(idxs)}) ...")
+            lag_map, corr_map, p_map = compute_best_lag_maps_for_indices(
+                stacks["SPEI"], stacks[ind], idxs, max_lag=max_lag, min_valid=min_valid_corr
+            )
+            write_geotiff_single(os.path.join(out_dir, f"bestlag_{ind}_vs_SPEI_{year}.tif"), lag_map.astype(np.float32), prof_out, nodata)
+            write_geotiff_single(os.path.join(out_dir, f"bestcorr_{ind}_vs_SPEI_{year}.tif"), corr_map.astype(np.float32), prof_out, nodata)
+            write_geotiff_single(os.path.join(out_dir, f"bestp_{ind}_vs_SPEI_{year}.tif"), p_map.astype(np.float32), prof_out, nodata)
+            year_level_maps[year][ind] = (lag_map, corr_map, p_map)
+
+    # 4) event loop
+    for idx, (_, ev) in enumerate(df_events.iterrows()):
+        eid = int(ev.get("event_id", idx + 1))
+        year = int(ev["year"])
+        print(f"\n=== Event {eid} Year {year} ===")
+        event_dir = os.path.join(out_dir, f"Year_{year}", f"Event_{eid}")
+        os.makedirs(event_dir, exist_ok=True)
+
+        # parse window
+        start_ym = None
+        end_ym = None
+
+        if "start_ym" in ev.index and pd.notna(ev["start_ym"]):
+            start_ym = str(int(ev["start_ym"])) if not isinstance(ev["start_ym"], str) else ev["start_ym"]
+        elif "start" in ev.index and pd.notna(ev["start"]):
+            try:
+                start_ym = pd.to_datetime(ev["start"]).strftime("%Y%m")
+            except Exception:
+                start_ym = str(ev["start"])[:6]
+
+        if "end_ym" in ev.index and pd.notna(ev["end_ym"]):
+            end_ym = str(int(ev["end_ym"])) if not isinstance(ev["end_ym"], str) else ev["end_ym"]
+        elif "end" in ev.index and pd.notna(ev["end"]):
+            try:
+                end_ym = pd.to_datetime(ev["end"]).strftime("%Y%m")
+            except Exception:
+                end_ym = str(ev["end"])[:6]
+
+        if start_ym and end_ym:
+            idxs = sorted([ym_to_idx[ym] for ym in yms_ref if (ym >= start_ym and ym <= end_ym and ym in ym_to_idx)])
+        else:
+            idxs = sorted([idx for ym, idx in ym_to_idx.items() if ym.startswith(str(year))])
+
+        event_t_len = len(idxs)
+        too_short = event_t_len < min_valid_corr
+        if too_short:
+            print(f"Event window length {event_t_len} < min_valid_for_corr ({min_valid_corr}); fallback to YEAR-level.")
+        else:
+            print(f"Event window length {event_t_len}; computing event-level lag maps.")
+
+        event_level_maps = {}
+        if (not too_short) and (event_t_len > 1):
+            for ind in ["NDVI", "LAI", "GPP", "SIF"]:
+                lag_map, corr_map, p_map = compute_best_lag_maps_for_indices(
+                    stacks["SPEI"], stacks[ind], idxs, max_lag=max_lag, min_valid=min_valid_corr
+                )
+                write_geotiff_single(os.path.join(event_dir, f"bestlag_{ind}_vs_SPEI_event{eid}.tif"), lag_map.astype(np.float32), prof_out, nodata)
+                write_geotiff_single(os.path.join(event_dir, f"bestcorr_{ind}_vs_SPEI_event{eid}.tif"), corr_map.astype(np.float32), prof_out, nodata)
+                write_geotiff_single(os.path.join(event_dir, f"bestp_{ind}_vs_SPEI_event{eid}.tif"), p_map.astype(np.float32), prof_out, nodata)
+                event_level_maps[ind] = (lag_map, corr_map, p_map)
+
+        # 5) per-pixel feature maps
+        out_maps = {
+            ind: {k: np.full((H, W), np.nan, dtype=float) for k in ["thr", "auc", "mcc", "ig", "rho", "theta", "C_gauss", "C_clay"]}
+            for ind in ["NDVI", "LAI", "GPP", "SIF"]
+        }
+
+        spei_stack = stacks["SPEI"]
+        coords = [(i, j) for i in range(H) for j in range(W)]
+        pbar = tqdm(coords, desc=f"Event {eid} pixels", total=len(coords), leave=False)
+
+        grid = np.linspace(0.01, 0.99, grid_n)
+
+        for (i, j) in pbar:
+            spei_ts = spei_stack[:, i, j]
+            if np.all(np.isnan(spei_ts)):
+                continue
+
+            label = (spei_ts < spei_thr).astype(int)
+            if label.sum() == 0 or label.sum() == len(label):
+                continue
+
+            u_spei = empirical_u(spei_ts)
+            mask_d = (spei_ts < spei_thr) & np.isfinite(u_spei)
+            u0 = np.nanmax(u_spei[mask_d]) if np.any(mask_d) else 0.2
+
+            for ind in ["NDVI", "LAI", "GPP", "SIF"]:
+                feat_ts = stacks[ind][:, i, j]
+                if np.all(np.isnan(feat_ts)):
+                    continue
+
+                # lag priority: event-level -> year-level -> 0
+                L = 0
+                got_event_L = False
+                if ind in event_level_maps:
+                    vL = event_level_maps[ind][0][i, j]
+                    if np.isfinite(vL) and int(vL) >= 0:
+                        L = int(vL)
+                        got_event_L = True
+                if (not got_event_L) and (year in year_level_maps) and (ind in year_level_maps[year]):
+                    vL = year_level_maps[year][ind][0][i, j]
+                    if np.isfinite(vL) and int(vL) >= 0:
+                        L = int(vL)
+
+                feat_shifted = shift_series_forward(feat_ts, L)
+                v = empirical_u(feat_shifted)
+
+                rho = fit_gaussian_copula_u(u_spei, v)
+                theta = fit_clayton_theta_from_kendall(u_spei, v)
+
+                # grid search in u-space for best mutual information
+                mask = np.isfinite(u_spei) & np.isfinite(v)
+                if mask.sum() < min_valid_thr:
+                    continue
+
+                best_mi = -1.0
+                best_thr_u = np.nan
+                for gv in grid:
+                    ind_bin = (v <= gv).astype(int)
+                    mi = mi_binary(ind_bin[mask], label[mask])
+                    if mi > best_mi:
+                        best_mi = mi
+                        best_thr_u = gv
+
+                if not np.isfinite(best_thr_u):
+                    thr_y, auc_v, mcc_v = youden_threshold_from_scores(feat_shifted, label, min_valid_thr)
+                    ig_v = information_gain_univar(feat_shifted, label, min_valid_thr)
+                    out = out_maps[ind]
+                    out["thr"][i, j] = thr_y
+                    out["auc"][i, j] = auc_v
+                    out["mcc"][i, j] = mcc_v
+                    out["ig"][i, j] = ig_v
+                    out["rho"][i, j] = rho
+                    out["theta"][i, j] = theta
+                    continue
+
+                mask_fv = np.isfinite(feat_shifted)
+                q = np.nanquantile(feat_shifted[mask_fv], best_thr_u) if mask_fv.sum() >= min_valid_thr else np.nan
+
+                thr_y, auc_v, mcc_v = youden_threshold_from_scores(feat_shifted, label, min_valid_thr)
+                ig_v = information_gain_univar(feat_shifted, label, min_valid_thr)
+                Cg = gaussian_copula_cdf(u0, best_thr_u, rho)
+                Cc = clayton_copula_cdf(u0, best_thr_u, theta)
+
+                out = out_maps[ind]
+                out["thr"][i, j] = q
+                out["auc"][i, j] = auc_v
+                out["mcc"][i, j] = mcc_v
+                out["ig"][i, j] = ig_v
+                out["rho"][i, j] = rho
+                out["theta"][i, j] = theta
+                out["C_gauss"][i, j] = Cg
+                out["C_clay"][i, j] = Cc
+
+        # write outputs
+        for ind, comps in out_maps.items():
+            for comp, arr in comps.items():
+                out_path = os.path.join(event_dir, f"event_{eid}_{ind}_{comp}.tif")
+                write_geotiff_single(out_path, arr, prof_out, nodata)
+            print(f"  wrote Event {eid} {ind}")
+
+        if too_short:
+            with open(os.path.join(event_dir, "README.txt"), "w", encoding="utf-8") as fh:
+                fh.write(
+                    f"Event {eid} (Year {year}) window length {event_t_len} < min_valid_for_corr ({min_valid_corr}).\n"
+                    "For pixels where event-level lag/corr could not be computed, year-level lag/corr were used as fallback.\n"
+                )
+
+    print(f"All done. Output in: {out_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True, help="Path to YAML config file.")
+    parser.add_argument("--mode", choices=["raw", "stdz"], default="raw", help="raw = no standardization; stdz = zscore per pixel.")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    out_base = cfg.get("out_base", "./outputs/")
+    os.makedirs(out_base, exist_ok=True)
+
+    use_standardized = (args.mode == "stdz")
+    out_dir = os.path.join(out_base, args.mode)
+
+    run_pipeline(cfg, out_dir=out_dir, use_standardized=use_standardized)
+
+
+if __name__ == "__main__":
+    main()
